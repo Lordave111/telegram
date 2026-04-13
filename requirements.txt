@@ -1,3 +1,1 @@
-python-telegram-bot[job-queue]==21.6
-anthropic>=0.25.0
-python-telegram-bot google-generativeai
+python-telegram-bot[job-queue]
