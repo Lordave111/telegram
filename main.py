@@ -1,9 +1,7 @@
 import os
 import sqlite3
 import logging
-import json
-import re
-import google.generativeai as genai
+import random
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 from threading import Thread
@@ -13,169 +11,137 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-# --- Configuration & Security ---
-# Note: Use environment variables for production!
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = "AIzaSyDcB9f_ItpfWuhJy0YCb6kzaMPPKfpnuVE"
-TIMEZONE_STR = os.environ.get("TIMEZONE", "Africa/Lagos")
-TIMEZONE = ZoneInfo(TIMEZONE_STR)
-DB_PATH = "assistant.db"
+# --- Config ---
+TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "America/New_York"))
+DB_PATH = "assistant_pro.db"
 
-# Configure Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+logging.basicConfig(level=logging.INFO)
 
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --- Database Management ---
-
+# --- Database Setup ---
 def db_init():
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                title TEXT,
-                start TEXT,
-                done INTEGER DEFAULT 0
-            )
-        """)
+        conn.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, chat_id INTEGER, title TEXT, status TEXT DEFAULT 'pending')")
+        conn.execute("CREATE TABLE IF NOT EXISTS finance (id INTEGER PRIMARY KEY, chat_id INTEGER, amount REAL, category TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, chat_id INTEGER, content TEXT)")
         conn.commit()
 
-def get_todays_tasks(chat_id):
-    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT title, start FROM tasks WHERE chat_id = ? AND start LIKE ? AND done = 0",
-            (chat_id, f"{today}%")
-        ).fetchall()
-    return [f"• {r['title']} at {r['start'][11:16]}" for r in rows]
+# --- Rules-Based Chat Engine ---
+def get_chat_response(text):
+    text = text.lower()
+    
+    responses = {
+        "greetings": ["Hello! How can I help you today?", "Hi there! Ready to get organized?", "Hey! What's on the agenda?"],
+        "identity": ["I am Dave, your personal command-based assistant.", "I'm your assistant! I don't use AI, so I'm fast and always reliable."],
+        "status": ["I'm running perfectly!", "All systems go. Ready for your commands."],
+        "thanks": ["You're welcome!", "No problem, happy to help!", "Anytime!"]
+    }
 
-# --- AI Integration Logic ---
+    if any(word in text for word in ["hi", "hello", "hey", "good morning", "good evening"]):
+        return random.choice(responses["greetings"])
+    
+    if any(word in text for word in ["who are you", "your name", "what are you"]):
+        return random.choice(responses["identity"])
+    
+    if "how are you" in text:
+        return random.choice(responses["status"])
 
-async def get_ai_chat_response(prompt: str):
-    """Answers general user questions."""
-    try:
-        response = model.generate_content(f"You are a witty, helpful AI personal assistant. User says: {prompt}")
-        return response.text
-    except Exception as e:
-        logger.error(f"Gemini Chat Error: {e}")
-        return "I'm a bit overwhelmed right now. Can we try that again?"
+    if any(word in text for word in ["thank", "thanks"]):
+        return random.choice(responses["thanks"])
 
-async def ai_parse_task(text: str):
-    """Extracts task info using AI."""
-    now = datetime.now(TIMEZONE)
-    prompt = (
-        f"Today's date/time is {now.strftime('%Y-%m-%d %H:%M')}. "
-        f"Extract the task title and time from: '{text}'. "
-        "Return ONLY a JSON object: {\"title\": \"...\", \"start_iso\": \"YYYY-MM-DDTHH:MM:SS\"}. "
-        "If no time is provided, assume today at 12:00:00."
-    )
-    try:
-        response = model.generate_content(prompt)
-        match = re.search(r'\{.*\}', response.text, re.DOTALL)
-        return json.loads(match.group()) if match else None
-    except Exception as e:
-        logger.error(f"AI Task Parsing Error: {e}")
-        return None
+    return "💬 I'm not sure how to respond to that, but I can manage your tasks! Type /help to see what I can do."
 
 # --- Scheduled Briefings ---
-
-async def daily_briefing(context: ContextTypes.JOB):
-    """Sends morning, afternoon, and night updates."""
+async def send_briefing(context: ContextTypes.JOB):
     chat_id = context.job.chat_id
-    label = context.job.data  # "Morning", "Afternoon", or "Night"
-    tasks = get_todays_tasks(chat_id)
-    task_list = "\n".join(tasks) if tasks else "No tasks scheduled yet."
-
-    prompt = (
-        f"It's {label} briefing time. Here is the user's schedule:\n{task_list}\n"
-        "Give a warm, concise update. If it's night, reflect on the day. "
-        "If it's morning, be motivating."
-    )
+    period = context.job.data # Morning, Afternoon, or Night
     
-    try:
-        response = model.generate_content(prompt)
-        await context.bot.send_message(chat_id=chat_id, text=response.text, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Briefing Error: {e}")
+    with sqlite3.connect(DB_PATH) as conn:
+        tasks = conn.execute("SELECT title FROM tasks WHERE chat_id=? AND status='pending'", (chat_id,)).fetchall()
+    
+    task_list = "\n".join([f"• {t[0]}" for t in tasks]) if tasks else "No pending tasks."
+    
+    messages = {
+        "Morning": f"☀️ **Good Morning!**\nHere is your plan for today:\n\n{task_list}",
+        "Afternoon": f"🌤 **Good Afternoon!**\nQuick check-in. Remaining tasks:\n\n{task_list}",
+        "Night": f"🌙 **Good Night!**\nRest well. Here is what's left for tomorrow:\n\n{task_list}"
+    }
+    
+    await context.bot.send_message(chat_id=chat_id, text=messages[period], parse_mode="Markdown")
 
-# --- Telegram Command & Message Handlers ---
-
+# --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     
-    # Schedule the 3 daily messages (Morning 8am, Afternoon 1pm, Night 9pm)
+    # Schedule Morning (8am), Afternoon (1pm), and Night (9pm)
     times = [time(8, 0), time(13, 0), time(21, 0)]
     labels = ["Morning", "Afternoon", "Night"]
     
-    # Clean existing jobs to avoid duplicates
-    current_jobs = context.job_queue.get_jobs_by_name(f"user_{chat_id}")
-    for job in current_jobs: job.schedule_removal()
-
     for t, label in zip(times, labels):
-        context.job_queue.run_daily(
-            daily_briefing, t.replace(tzinfo=TIMEZONE), 
-            chat_id=chat_id, data=label, name=f"user_{chat_id}"
-        )
+        context.job_queue.run_daily(send_briefing, t.replace(tzinfo=TIMEZONE), chat_id=chat_id, data=label)
 
     await update.message.reply_text(
-        "👋 **Assistant Online!**\n\nI will now message you every morning, afternoon, and night.\n"
-        "• **Chat:** Ask me anything.\n"
-        "• **Tasks:** Say 'Remind me to...' or 'Add task...'",
+        "🚀 **Dave Assistant Activated!**\n"
+        "I will message you 3 times a day.\n\n"
+        "**Commands:**\n"
+        "/add [task] - Add a todo\n"
+        "/list - Show tasks\n"
+        "/spend [amt] [cat] - Track money\n"
+        "/memo [text] - Save a note\n"
+        "/calc [math] - Calculator\n"
+        "/help - See all commands\n\n"
+        "Or just say 'Hello' to me!",
         parse_mode="Markdown"
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    chat_id = update.effective_chat.id
+async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    title = " ".join(context.args)
+    if not title: return await update.message.reply_text("❌ Usage: /add Buy Milk")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT INTO tasks (chat_id, title) VALUES (?,?)", (update.effective_chat.id, title))
+    await update.message.reply_text(f"✅ Added: {title}")
 
-    # Smart Task Detection
-    triggers = ["remind", "task", "todo", "schedule", "add"]
-    if any(word in user_text.lower() for word in triggers):
-        await update.message.reply_chat_action("typing")
-        data = await ai_parse_task(user_text)
-        if data:
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("INSERT INTO tasks (chat_id, title, start) VALUES (?,?,?)",
-                             (chat_id, data['title'], data['start_iso']))
-            await update.message.reply_text(f"✅ **Task Saved**\n📌 {data['title']}\n⏰ {data['start_iso']}", parse_mode="Markdown")
-            return
+async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT id, title FROM tasks WHERE chat_id=? AND status='pending'", (update.effective_chat.id,)).fetchall()
+    text = "📋 **Your Tasks:**\n" + "\n".join([f"{r[0]}. {r[1]}" for r in rows]) if rows else "📭 No tasks."
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-    # General AI Chat
-    await update.message.reply_chat_action("typing")
-    response = await get_ai_chat_response(user_text)
+async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    response = get_chat_response(update.message.text)
     await update.message.reply_text(response)
 
-# --- Flask Heartbeat (for Render/Deployment) ---
+async def calculate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        res = eval(" ".join(context.args))
+        await update.message.reply_text(f"🔢 Result: {res}")
+    except: await update.message.reply_text("❌ Error in math.")
+
+# --- Flask Server ---
 server = Flask('')
 @server.route('/')
-def home(): return "Assistant is running."
-
-def run_server():
-    server.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
-
-# --- Main Initialization ---
+def home(): return "Bot Running"
 
 def main():
     db_init()
-    Thread(target=run_server, daemon=True).start()
+    Thread(target=lambda: server.run(host='0.0.0.0', port=8080), daemon=True).start()
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("add", add_task))
+    app.add_handler(CommandHandler("list", list_tasks))
+    app.add_handler(CommandHandler("calc", calculate))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
 
-    print("Bot is polling...")
+    print("Assistant is online.")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+    
