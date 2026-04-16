@@ -1,10 +1,10 @@
 import os
-import json
 import sqlite3
-import calendar
 import logging
+import json
 import re
-from datetime import datetime, timedelta, date
+import google.generativeai as genai
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 from threading import Thread
 
@@ -15,40 +15,26 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
-    ConversationHandler,
     ContextTypes,
     filters,
 )
 
-# ── RENDER HEARTBEAT (Flask) ──────────────────────────────────────────────────
-server = Flask('')
+# --- Configuration & Security ---
+# Note: Use environment variables for production!
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = "AIzaSyDcB9f_ItpfWuhJy0YCb6kzaMPPKfpnuVE"
+TIMEZONE_STR = os.environ.get("TIMEZONE", "Africa/Lagos")
+TIMEZONE = ZoneInfo(TIMEZONE_STR)
+DB_PATH = "assistant.db"
 
-@server.route('/')
-def home():
-    return "Bot is running and healthy!"
+# Configure Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
 
-def run_server():
-    port = int(os.environ.get("PORT", 8080))
-    server.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = Thread(target=run_server)
-    t.daemon = True
-    t.start()
-
-# ── Config ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
-TIMEZONE         = os.environ.get("TIMEZONE", "America/New_York")
-REMINDER_MINS    = int(os.environ.get("REMINDER_MINUTES", "10"))
-DB_PATH          = os.environ.get("DB_PATH", "scheduler.db")
-
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Conversation States ───────────────────────────────────────────────────────
-PICK_DATE, PICK_TIME, PICK_DURATION, TYPE_TITLE = range(4)
-
-# ── SQLite Database ───────────────────────────────────────────────────────────
+# --- Database Management ---
 
 def db_init():
     with sqlite3.connect(DB_PATH) as conn:
@@ -58,189 +44,138 @@ def db_init():
                 chat_id INTEGER,
                 title TEXT,
                 start TEXT,
-                end TEXT,
-                priority TEXT DEFAULT 'medium',
                 done INTEGER DEFAULT 0
             )
         """)
         conn.commit()
 
-def get_tasks(chat_id: int, day: date = None) -> list:
+def get_todays_tasks(chat_id):
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
-        if day:
-            day_str = day.isoformat()
-            rows = conn.execute("SELECT * FROM tasks WHERE chat_id = ? AND start LIKE ? ORDER BY start", 
-                                (chat_id, f"{day_str}%")).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM tasks WHERE chat_id = ? ORDER BY start", (chat_id,)).fetchall()
-    return [dict(r) for r in rows]
+        rows = conn.execute(
+            "SELECT title, start FROM tasks WHERE chat_id = ? AND start LIKE ? AND done = 0",
+            (chat_id, f"{today}%")
+        ).fetchall()
+    return [f"• {r['title']} at {r['start'][11:16]}" for r in rows]
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# --- AI Integration Logic ---
 
-def now_local() -> datetime:
-    return datetime.now(ZoneInfo(TIMEZONE))
+async def get_ai_chat_response(prompt: str):
+    """Answers general user questions."""
+    try:
+        response = model.generate_content(f"You are a witty, helpful AI personal assistant. User says: {prompt}")
+        return response.text
+    except Exception as e:
+        logger.error(f"Gemini Chat Error: {e}")
+        return "I'm a bit overwhelmed right now. Can we try that again?"
 
-def fmt_time(iso: str) -> str:
-    return datetime.fromisoformat(iso).strftime("%I:%M %p")
+async def ai_parse_task(text: str):
+    """Extracts task info using AI."""
+    now = datetime.now(TIMEZONE)
+    prompt = (
+        f"Today's date/time is {now.strftime('%Y-%m-%d %H:%M')}. "
+        f"Extract the task title and time from: '{text}'. "
+        "Return ONLY a JSON object: {\"title\": \"...\", \"start_iso\": \"YYYY-MM-DDTHH:MM:SS\"}. "
+        "If no time is provided, assume today at 12:00:00."
+    )
+    try:
+        response = model.generate_content(prompt)
+        match = re.search(r'\{.*\}', response.text, re.DOTALL)
+        return json.loads(match.group()) if match else None
+    except Exception as e:
+        logger.error(f"AI Task Parsing Error: {e}")
+        return None
 
-# ── Keyboards ─────────────────────────────────────────────────────────────────
+# --- Scheduled Briefings ---
 
-def main_menu_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Task", callback_data="btn_add"), 
-         InlineKeyboardButton("📅 Today's List", callback_data="view_today")],
-        [InlineKeyboardButton("⏭ Tomorrow", callback_data="view_tomorrow"),
-         InlineKeyboardButton("🗑 Clear All", callback_data="btn_clear")]
-    ])
+async def daily_briefing(context: ContextTypes.JOB):
+    """Sends morning, afternoon, and night updates."""
+    chat_id = context.job.chat_id
+    label = context.job.data  # "Morning", "Afternoon", or "Night"
+    tasks = get_todays_tasks(chat_id)
+    task_list = "\n".join(tasks) if tasks else "No tasks scheduled yet."
 
-def build_calendar_kb(year, month):
-    kb = [[InlineKeyboardButton(f"{calendar.month_name[month]} {year}", callback_data="ignore")]]
-    kb.append([InlineKeyboardButton(d, callback_data="ignore") for d in ["Mo","Tu","We","Th","Fr","Sa","Su"]])
-    for week in calendar.monthcalendar(year, month):
-        row = []
-        for d in week:
-            if d == 0: row.append(InlineKeyboardButton(" ", callback_data="ignore"))
-            else:
-                row.append(InlineKeyboardButton(str(d), callback_data=f"day_{year}_{month}_{d}"))
-        kb.append(row)
-    return InlineKeyboardMarkup(kb)
+    prompt = (
+        f"It's {label} briefing time. Here is the user's schedule:\n{task_list}\n"
+        "Give a warm, concise update. If it's night, reflect on the day. "
+        "If it's morning, be motivating."
+    )
+    
+    try:
+        response = model.generate_content(prompt)
+        await context.bot.send_message(chat_id=chat_id, text=response.text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Briefing Error: {e}")
 
-def build_duration_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("30 Mins", callback_data="dur_30"), InlineKeyboardButton("1 Hour", callback_data="dur_60")],
-        [InlineKeyboardButton("2 Hours", callback_data="dur_120"), InlineKeyboardButton("3 Hours", callback_data="dur_180")]
-    ])
-
-# ── Command Handlers ──────────────────────────────────────────────────────────
+# --- Telegram Command & Message Handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    
+    # Schedule the 3 daily messages (Morning 8am, Afternoon 1pm, Night 9pm)
+    times = [time(8, 0), time(13, 0), time(21, 0)]
+    labels = ["Morning", "Afternoon", "Night"]
+    
+    # Clean existing jobs to avoid duplicates
+    current_jobs = context.job_queue.get_jobs_by_name(f"user_{chat_id}")
+    for job in current_jobs: job.schedule_removal()
+
+    for t, label in zip(times, labels):
+        context.job_queue.run_daily(
+            daily_briefing, t.replace(tzinfo=TIMEZONE), 
+            chat_id=chat_id, data=label, name=f"user_{chat_id}"
+        )
+
     await update.message.reply_text(
-        "⚡ *AI-Ready Scheduler Bot*\nUse the buttons below to manage your day.",
-        parse_mode="Markdown",
-        reply_markup=main_menu_kb()
+        "👋 **Assistant Online!**\n\nI will now message you every morning, afternoon, and night.\n"
+        "• **Chat:** Ask me anything.\n"
+        "• **Tasks:** Say 'Remind me to...' or 'Add task...'",
+        parse_mode="Markdown"
     )
 
-async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    now = now_local()
-    msg = update.callback_query.message if update.callback_query else update.message
-    await msg.reply_text("📅 *Pick a Date:*", parse_mode="Markdown", 
-                         reply_markup=build_calendar_kb(now.year, now.month))
-    return PICK_DATE
-
-async def date_picked(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    _, y, m, d = query.data.split("_")
-    context.user_data["temp_task"] = {"date": f"{y}-{int(m):02d}-{int(d):02d}"}
-    
-    # Hour picker
-    hours = [[InlineKeyboardButton(f"{h}:00", callback_data=f"h_{h}") for h in range(8, 12)],
-             [InlineKeyboardButton(f"{h}:00", callback_data=f"h_{h}") for h in range(12, 16)],
-             [InlineKeyboardButton(f"{h}:00", callback_data=f"h_{h}") for h in range(16, 21)]]
-    await query.edit_message_text("🕒 *Pick Start Hour:*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(hours))
-    return PICK_TIME
-
-async def time_picked(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data["temp_task"]["hour"] = int(query.data.split("_")[1])
-    await query.edit_message_text("⏳ *How long will this take?*", parse_mode="Markdown", reply_markup=build_duration_kb())
-    return PICK_DURATION
-
-async def duration_picked(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data["temp_task"]["dur"] = int(query.data.split("_")[1])
-    await query.edit_message_text("✍️ Type the *Task Title*: ", parse_mode="Markdown")
-    return TYPE_TITLE
-
-async def save_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    title = update.message.text
-    data = context.user_data["temp_task"]
-    
-    start_dt = datetime.fromisoformat(f"{data['date']}T{data['hour']:02d}:00:00")
-    end_dt = start_dt + timedelta(minutes=data['dur'])
-    
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT INTO tasks (chat_id, title, start, end) VALUES (?,?,?,?)",
-                     (update.effective_chat.id, title, start_dt.isoformat(), end_dt.isoformat()))
-    
-    await update.message.reply_text(f"✅ *Saved: {title}*\n{start_dt.strftime('%b %d at %I:%M %p')}", 
-                                    parse_mode="Markdown", reply_markup=main_menu_kb())
-    return ConversationHandler.END
-
-# ── View & Actions ────────────────────────────────────────────────────────────
-
-async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE, day_offset=0):
-    query = update.callback_query
-    target_date = now_local().date() + timedelta(days=day_offset)
-    tasks = get_tasks(update.effective_chat.id, target_date)
-    
-    if not tasks:
-        text = f"📭 No tasks for {target_date.strftime('%A')}."
-        kb = [[InlineKeyboardButton("➕ Add One", callback_data="btn_add")]]
-    else:
-        text = f"📅 *Schedule for {target_date.strftime('%A, %b %d')}*\n\n"
-        kb = []
-        for t in tasks:
-            status = "✅" if t['done'] else "🔲"
-            text += f"{status} `{fmt_time(t['start'])}` - *{t['title']}*\n"
-            kb.append([InlineKeyboardButton(f"✅ Done: {t['title'][:15]}", callback_data=f"done_{t['id']}"),
-                       InlineKeyboardButton("🗑 Delete", callback_data=f"del_{t['id']}")])
-    
-    kb.append([InlineKeyboardButton("🔙 Back", callback_data="menu")])
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
     chat_id = update.effective_chat.id
 
-    if data == "view_today": await show_schedule(update, context, 0)
-    elif data == "view_tomorrow": await show_schedule(update, context, 1)
-    elif data == "menu": await query.edit_message_text("Main Menu:", reply_markup=main_menu_kb())
-    elif data == "btn_clear":
-        with sqlite3.connect(DB_PATH) as conn: conn.execute("DELETE FROM tasks WHERE chat_id=?", (chat_id,))
-        await query.answer("Cleared!")
-        await query.edit_message_text("🗑 All tasks deleted.", reply_markup=main_menu_kb())
-    elif data.startswith("done_"):
-        tid = data.split("_")[1]
-        with sqlite3.connect(DB_PATH) as conn: conn.execute("UPDATE tasks SET done=1 WHERE id=?", (tid,))
-        await query.answer("Marked as done!")
-        await show_schedule(update, context, 0)
-    elif data.startswith("del_"):
-        tid = data.split("_")[1]
-        with sqlite3.connect(DB_PATH) as conn: conn.execute("DELETE FROM tasks WHERE id=?", (tid,))
-        await query.answer("Deleted!")
-        await show_schedule(update, context, 0)
+    # Smart Task Detection
+    triggers = ["remind", "task", "todo", "schedule", "add"]
+    if any(word in user_text.lower() for word in triggers):
+        await update.message.reply_chat_action("typing")
+        data = await ai_parse_task(user_text)
+        if data:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("INSERT INTO tasks (chat_id, title, start) VALUES (?,?,?)",
+                             (chat_id, data['title'], data['start_iso']))
+            await update.message.reply_text(f"✅ **Task Saved**\n📌 {data['title']}\n⏰ {data['start_iso']}", parse_mode="Markdown")
+            return
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+    # General AI Chat
+    await update.message.reply_chat_action("typing")
+    response = await get_ai_chat_response(user_text)
+    await update.message.reply_text(response)
+
+# --- Flask Heartbeat (for Render/Deployment) ---
+server = Flask('')
+@server.route('/')
+def home(): return "Assistant is running."
+
+def run_server():
+    server.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+
+# --- Main Initialization ---
 
 def main():
     db_init()
-    keep_alive() # Starts Flask server for Render
+    Thread(target=run_server, daemon=True).start()
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(add_start, pattern="^btn_add$")],
-        states={
-            PICK_DATE: [CallbackQueryHandler(date_picked, pattern="^day_")],
-            PICK_TIME: [CallbackQueryHandler(time_picked, pattern="^h_")],
-            PICK_DURATION: [CallbackQueryHandler(duration_picked, pattern="^dur_")],
-            TYPE_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_task)],
-        },
-        fallbacks=[CommandHandler("cancel", start)],
-    )
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot is starting...")
+    print("Bot is polling...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-    
